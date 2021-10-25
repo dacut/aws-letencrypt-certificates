@@ -1,9 +1,9 @@
 use crate::{
-    constants::{ACM_STATUS_EXPIRED, ACM_STATUS_ISSUED, ACM_TYPE_IMPORTED},
+    constants::{ACM_STATUS_EXPIRED, ACM_STATUS_ISSUED, ACM_TYPE_IMPORTED, S3_ENCRYPTION_AES, S3_ENCRYPTION_KMS},
     errors::{CertificateRequestError, InvalidCertificateRequest},
     utils::{
         CertificateComponents,
-        default_false, empty_string, s3_bucket_location_constraint_to_region, validate_and_sanitize_ssm_parameter_path,
+        default_aes256, default_false, empty_string, s3_bucket_location_constraint_to_region, validate_and_sanitize_ssm_parameter_path,
     },
 };
 use bytes::Bytes;
@@ -18,7 +18,7 @@ use rusoto_acm::{
     ImportCertificateResponse, ListCertificatesRequest,
 };
 use rusoto_core::{Region, RusotoError};
-use rusoto_s3::{GetBucketLocationRequest, S3Client, S3};
+use rusoto_s3::{GetBucketLocationRequest, PutObjectRequest, S3Client, S3, StreamingBody};
 use rusoto_ssm::{GetParameterRequest, PutParameterRequest, Ssm, SsmClient};
 use serde::{self, Deserialize, Serialize};
 use std::{
@@ -341,7 +341,21 @@ impl Future for AcmImportTask {
 ///
 ///         // The prefix to use for the certificate keys. Note that a "/" is not automatically
 ///         // appended.
-///         "Path": str,
+///         "Prefix": str,
+/// 
+///         // The encryption type to use for the certificate components. This must be either "AES256" or "aws:kms". This defaults to "AES256".
+///         "ComponentEncryptionType": str,
+/// 
+///         // If ComponentEncryptionType is "aws:kms", this is the KMS key ARN to use for encryption. If
+///         // not specified, the default "aws/s3" key is used.
+///         "ComponentKmsKey": str,
+/// 
+///         // The encryption type to use for the private key. This must be either "AES256" or "aws:kms". This defaults to "AES256".
+///         "PrivateKeyEncryptionType": str,
+/// 
+///         // If PrivateKeyEncryptionType is "aws:kms", this is the KMS key ARN to use for encryption. If
+///         // not specified, the default "aws/s3" key is used.
+///         "PrivateKeyKmsKey": str,
 ///     }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct S3Storage {
@@ -351,6 +365,18 @@ pub(crate) struct S3Storage {
     #[serde(rename = "Prefix", default = "empty_string")]
     pub(crate) prefix: String,
 
+    #[serde(rename = "ComponentEncryptionType", default = "default_aes256")]
+    pub(crate) component_encryption_type: String,
+
+    #[serde(rename = "ComponentKmsKey")]
+    pub(crate) component_kms_key: Option<String>,
+
+    #[serde(rename = "PrivateKeyEncryptionType", default = "default_aes256")]
+    pub(crate) pkey_encryption_type: String,
+
+    #[serde(rename = "PrivateKeyKmsKey")]
+    pub(crate) pkey_kms_key: Option<String>,
+
     #[serde(skip)]
     pub(crate) region: Option<Region>,
 }
@@ -359,6 +385,24 @@ impl S3Storage {
     pub(crate) async fn validate(&mut self) -> Result<(), LambdaError> {
         if self.bucket.is_empty() {
             return Err(InvalidCertificateRequest::invalid_s3_bucket(self.bucket.clone()));
+        }
+
+        match self.component_encryption_type.as_ref() {
+            S3_ENCRYPTION_AES | S3_ENCRYPTION_KMS => {}
+            _ => {
+                return Err(InvalidCertificateRequest::invalid_s3_encryption_algorithm(
+                    self.component_encryption_type.clone(),
+                ));
+            }
+        }
+
+        match self.pkey_encryption_type.as_ref() {
+            S3_ENCRYPTION_AES | S3_ENCRYPTION_KMS => {}
+            _ => {
+                return Err(InvalidCertificateRequest::invalid_s3_encryption_algorithm(
+                    self.component_encryption_type.clone(),
+                ));
+            }
         }
 
         let s3_client = S3Client::new(Region::default());
@@ -381,9 +425,75 @@ impl S3Storage {
     pub(crate) async fn save_certificate(
         &self,
         _domain_names: Vec<String>,
-        _components: CertificateComponents,
+        components: CertificateComponents,
     ) -> Result<Vec<CertificateStorageResult>, LambdaError> {
-        unimplemented!()
+        let s3_client = S3Client::new(self.region.clone().expect("Region should be set here"));
+        let cert_key = format!("{}cert.pem", self.prefix);
+        let chain_key = format!("{}chain.pem", self.prefix);
+        let fullchain_key = format!("{}fullchain.pem", self.prefix);
+        let pkey_key = format!("{}privkey.pem", self.prefix);
+        let cert_por = PutObjectRequest{
+            bucket: self.bucket.clone(),
+            key: cert_key.clone(),
+            server_side_encryption: Some(self.component_encryption_type.clone()),
+            ssekms_key_id: self.component_kms_key.clone(),
+            body: Some(StreamingBody::from(components.cert_pem.into_bytes())),
+            ..Default::default()
+        };
+        let chain_por = PutObjectRequest{
+            bucket: self.bucket.clone(),
+            key: chain_key.clone(),
+            server_side_encryption: Some(self.component_encryption_type.clone()),
+            ssekms_key_id: self.component_kms_key.clone(),
+            body: Some(StreamingBody::from(components.chain_pem.into_bytes())),
+            ..Default::default()
+        };
+        let fullchain_por = PutObjectRequest{
+            bucket: self.bucket.clone(),
+            key: fullchain_key.clone(),
+            server_side_encryption: Some(self.component_encryption_type.clone()),
+            ssekms_key_id: self.component_kms_key.clone(),
+            body: Some(StreamingBody::from(components.fullchain_pem.into_bytes())),
+            ..Default::default()
+        };
+        let pkey_por = PutObjectRequest{
+            bucket: self.bucket.clone(),
+            key: pkey_key.clone(),
+            server_side_encryption: Some(self.pkey_encryption_type.clone()),
+            ssekms_key_id: self.pkey_kms_key.clone(),
+            body: Some(StreamingBody::from(components.pkey_pem.into_bytes())),
+            ..Default::default()
+        };
+
+        let (cert_result, chain_result, fullchain_result, pkey_result) = tokio::join!(
+            s3_client.put_object(cert_por),
+            s3_client.put_object(chain_por),
+            s3_client.put_object(fullchain_por),
+            s3_client.put_object(pkey_por),
+        );
+
+        if let Err(e) = cert_result {
+            error!("Failed to save certificate: {}", e);
+            Err(Box::new(e))
+        } else if let Err(e) = chain_result {
+            error!("Failed to save certificate chain: {}", e);
+            Err(Box::new(e))
+        } else if let Err(e) = fullchain_result {
+            error!("Failed to save full certificate chain: {}", e);
+            Err(Box::new(e))
+        } else if let Err(e) = pkey_result {
+            error!("Failed to save private key: {}", e);
+            Err(Box::new(e))
+        } else {
+            let s3sr = S3StorageResult {
+                bucket: self.bucket.clone(),
+                certificate: cert_key,
+                chain: chain_key,
+                fullchain: fullchain_key,
+                pkey: pkey_key,
+            };
+            Ok(vec![CertificateStorageResult::S3(s3sr)])
+        }
     }
 }
 
@@ -572,10 +682,10 @@ pub(crate) struct S3StorageResult {
     pub(crate) chain: String,
 
     #[serde(rename = "FullChain")]
-    pub(crate) full_chain: String,
+    pub(crate) fullchain: String,
 
     #[serde(rename = "PrivateKey")]
-    pub(crate) private_key: String,
+    pub(crate) pkey: String,
 }
 
 /// The results of storaing a certificate in the AWS Systems Manager parameter store. In JSON:

@@ -17,6 +17,10 @@ pub(crate) const fn default_false() -> bool {
     false
 }
 
+pub(crate) fn default_aes256() -> String {
+    "AES256".to_string()
+}
+
 pub(crate) fn empty_string() -> String {
     "".to_string()
 }
