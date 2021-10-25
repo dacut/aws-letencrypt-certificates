@@ -4,7 +4,7 @@ use crate::{
     errors::CertificateRequestError,
     events::{CertificateResponse, CertificateResponseStatus, Response, ValidationState},
     storage::{CertificateStorage, CertificateStorageResult},
-    utils::ssm_acme_parameter_path,
+    utils::{CertificateComponents, ssm_acme_parameter_path},
 };
 use acme2::{Account, AccountBuilder, Csr, DirectoryBuilder, Directory, Order, OrderBuilder, OrderStatus};
 use futures::stream::{FuturesOrdered, StreamExt};
@@ -199,7 +199,7 @@ impl ValidatedCertificateRequest {
         }
     }
 
-    async fn retrieve_order(&self, order: Order, private_key_pem: String) -> Result<Response, LambdaError> {
+    async fn retrieve_order(&self, order: Order, pkey_pem: String) -> Result<Response, LambdaError> {
         // Ready -- download the certificates. We expect at least 2 -- our certificate and the
         // intermediate that signed it.
         info!("Downloading certificates");
@@ -242,46 +242,14 @@ impl ValidatedCertificateRequest {
         let fullchain_pem = format!("{}\n{}", cert_pem, chain_pem);
         let domain_names = order.identifiers.iter().map(|i| i.value.clone()).collect::<Vec<String>>();
 
-        let mut storage = Vec::new();
-        let mut n_successes = 0u32;
-        let mut n_failures = 0u32;
-
-        for storage_provider in &self.storage {
-            match storage_provider.save_certificate(
-                domain_names.clone(), chain_pem.clone(), cert_pem.clone(), fullchain_pem.clone(), private_key_pem.clone()
-            ).await {
-                Ok(result_set) => {
-                    for result in result_set {
-                        match &result {
-                            CertificateStorageResult::Error(_) => n_failures += 1,
-                            _ => n_successes += 1,
-                        }
-
-                        storage.push(result);
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to save certificate: {:#}", e);
-                    n_failures += 1;
-                    storage.push(CertificateStorageResult::Error(format!("Failed to save certificate: {:#}", e)));
-                }
-            }
-        }
- 
-        let status = if n_failures > 0 {
-            if n_successes > 0 { CertificateResponseStatus::PartialSuccess }
-            else { CertificateResponseStatus::Failed } 
-        } else {
-            CertificateResponseStatus::Success
+        let components = CertificateComponents {
+            cert_pem,
+            chain_pem,
+            fullchain_pem,
+            pkey_pem,
         };
-    
-        let cr = CertificateResponse {
-            finished: true,
-            status,
-            storage,
-            state: None,
-        };
-        Ok(Response::Certificate(cr))
+
+        save_certificates(self.storage.clone(), domain_names, components).await
     }
 
     async fn handle_pending_validation_request(&self) -> Result<Response, LambdaError> {
@@ -402,4 +370,53 @@ impl ValidatedCertificateRequest {
         account_builder.private_key(pkey);
         Ok(())
     }
+}
+
+async fn save_certificates(storage: Vec<CertificateStorage>, domain_names: Vec<String>, components: CertificateComponents) -> Result<Response, LambdaError> {
+    let mut n_successes = 0u32;
+    let mut n_failures = 0u32;
+
+    let mut futures = FuturesOrdered::new();
+    for storage_provider in &storage {
+        futures.push(storage_provider.save_certificate(
+            domain_names.clone(), components.clone()
+        ));
+    }
+
+    let mut results = Vec::new();
+
+    while let Some(result) = futures.next().await {
+        match result {
+            Ok(result_set) => {
+                for result in result_set {
+                    match &result {
+                        CertificateStorageResult::Error(_) => n_failures += 1,
+                        _ => n_successes += 1,
+                    }
+
+                    results.push(result);
+                }
+            }
+            Err(e) => {
+                error!("Failed to save certificate: {:#}", e);
+                n_failures += 1;
+                results.push(CertificateStorageResult::Error(format!("Failed to save certificate: {:#}", e)));
+            }
+        }
+    }
+
+    let status = if n_failures > 0 {
+        if n_successes > 0 { CertificateResponseStatus::PartialSuccess }
+        else { CertificateResponseStatus::Failed } 
+    } else {
+        CertificateResponseStatus::Success
+    };
+
+    let cr = CertificateResponse {
+        finished: true,
+        status,
+        storage: results,
+        state: None,
+    };
+    Ok(Response::Certificate(cr))
 }

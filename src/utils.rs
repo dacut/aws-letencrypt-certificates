@@ -5,6 +5,14 @@ use std::{
 };
 use rusoto_core::{Region, region::ParseRegionError};
 
+#[derive(Clone, Debug)]
+pub(crate) struct CertificateComponents {
+    pub(crate) cert_pem: String,
+    pub(crate) chain_pem: String,
+    pub(crate) fullchain_pem: String,
+    pub(crate) pkey_pem: String,
+}
+
 pub(crate) const fn default_false() -> bool {
     false
 }

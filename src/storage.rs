@@ -2,6 +2,7 @@ use crate::{
     constants::{ACM_STATUS_EXPIRED, ACM_STATUS_ISSUED, ACM_TYPE_IMPORTED},
     errors::{CertificateRequestError, InvalidCertificateRequest},
     utils::{
+        CertificateComponents,
         default_false, empty_string, s3_bucket_location_constraint_to_region, validate_and_sanitize_ssm_parameter_path,
     },
 };
@@ -47,20 +48,17 @@ impl CertificateStorage {
     pub(crate) async fn save_certificate(
         &self,
         domain_names: Vec<String>,
-        certificate_pem: String,
-        chain_pem: String,
-        fullchain_pem: String,
-        private_key_pem: String,
+        components: CertificateComponents
     ) -> Result<Vec<CertificateStorageResult>, LambdaError> {
         match self {
             CertificateStorage::Acm(storage) => {
-                storage.save_certificate(domain_names, certificate_pem, chain_pem, fullchain_pem, private_key_pem).await
+                storage.save_certificate(domain_names, components).await
             }
             CertificateStorage::S3(storage) => {
-                storage.save_certificate(domain_names, certificate_pem, chain_pem, fullchain_pem, private_key_pem).await
+                storage.save_certificate(domain_names, components).await
             }
             CertificateStorage::SsmParameter(storage) => {
-                storage.save_certificate(domain_names, certificate_pem, chain_pem, fullchain_pem, private_key_pem).await
+                storage.save_certificate(domain_names, components).await
             }
         }
     }
@@ -125,21 +123,18 @@ impl AcmStorage {
     pub(crate) async fn save_certificate(
         &self,
         domain_names: Vec<String>,
-        cert_pem: String,
-        chain_pem: String,
-        _fullchain_pem: String,
-        pkey_pem: String,
+        components: CertificateComponents
     ) -> Result<Vec<CertificateStorageResult>, LambdaError> {
         if self.force_new_import {
-            return self.import_new_certificate(cert_pem, chain_pem, pkey_pem).await;
+            return self.import_new_certificate(components).await;
         } else if let Some(existing_arns) = &self.certificate_arns {
-            return self.reimport_certificate(existing_arns.clone(), cert_pem, chain_pem, pkey_pem).await;
+            return self.reimport_certificate(existing_arns.clone(), components).await;
         } else {
             let existing_arns = self.find_matching_certificate(&domain_names).await?;
             if existing_arns.len() == 0 {
-                self.import_new_certificate(cert_pem, chain_pem, pkey_pem).await
+                self.import_new_certificate(components).await
             } else {
-                self.reimport_certificate(existing_arns, cert_pem, chain_pem, pkey_pem).await
+                self.reimport_certificate(existing_arns, components).await
             }
         }
     }
@@ -229,15 +224,13 @@ impl AcmStorage {
 
     async fn import_new_certificate(
         &self,
-        cert_pem: String,
-        chain_pem: String,
-        pkey_pem: String,
+        components: CertificateComponents
     ) -> Result<Vec<CertificateStorageResult>, LambdaError> {
         let acm = AcmClient::new(Region::default());
         let imp_req = ImportCertificateRequest {
-            certificate: Bytes::from(cert_pem),
-            certificate_chain: Some(Bytes::from(chain_pem)),
-            private_key: Bytes::from(pkey_pem),
+            certificate: Bytes::from(components.cert_pem),
+            certificate_chain: Some(Bytes::from(components.chain_pem)),
+            private_key: Bytes::from(components.pkey_pem),
             tags: None,
             ..Default::default()
         };
@@ -260,9 +253,7 @@ impl AcmStorage {
     async fn reimport_certificate(
         &self,
         existing_arns: Vec<String>,
-        cert_pem: String,
-        chain_pem: String,
-        pkey_pem: String,
+        components: CertificateComponents,
     ) -> Result<Vec<CertificateStorageResult>, LambdaError> {
         let mut f = FuturesUnordered::new();
         let tasks = existing_arns
@@ -270,10 +261,10 @@ impl AcmStorage {
             .into_iter()
             .map(|cert_arn| {
                 let imp_req = ImportCertificateRequest {
-                    certificate: Bytes::from(cert_pem.clone()),
+                    certificate: Bytes::from(components.cert_pem.clone()),
                     certificate_arn: Some(cert_arn.clone()),
-                    certificate_chain: Some(Bytes::from(chain_pem.clone())),
-                    private_key: Bytes::from(pkey_pem.clone()),
+                    certificate_chain: Some(Bytes::from(components.chain_pem.clone())),
+                    private_key: Bytes::from(components.pkey_pem.clone()),
                     tags: None,
                 };
 
@@ -390,10 +381,7 @@ impl S3Storage {
     pub(crate) async fn save_certificate(
         &self,
         _domain_names: Vec<String>,
-        _certificate_pem: String,
-        _chain_pem: String,
-        _fullchain_pem: String,
-        _private_key_pem: String,
+        _components: CertificateComponents,
     ) -> Result<Vec<CertificateStorageResult>, LambdaError> {
         unimplemented!()
     }
@@ -428,16 +416,13 @@ impl SsmParameterStorage {
     pub(crate) async fn save_certificate(
         &self,
         domain_names: Vec<String>,
-        cert_pem: String,
-        chain_pem: String,
-        fullchain_pem: String,
-        pkey_pem: String,
+        components: CertificateComponents,
     ) -> Result<Vec<CertificateStorageResult>, LambdaError> {
         let (cert, chain, fullchain, pkey) = tokio::join!(
-            self.write_cert_component_to_ssm(domain_names[0].clone(), cert_pem, "Certificate", false),
-            self.write_cert_component_to_ssm(domain_names[0].clone(), chain_pem, "Chain", false),
-            self.write_cert_component_to_ssm(domain_names[0].clone(), fullchain_pem, "FullChain", false),
-            self.write_cert_component_to_ssm(domain_names[0].clone(), pkey_pem, "PrivateKey", true),
+            self.write_cert_component_to_ssm(domain_names[0].clone(), components.cert_pem, "Certificate", false),
+            self.write_cert_component_to_ssm(domain_names[0].clone(), components.chain_pem, "Chain", false),
+            self.write_cert_component_to_ssm(domain_names[0].clone(), components.fullchain_pem, "FullChain", false),
+            self.write_cert_component_to_ssm(domain_names[0].clone(), components.pkey_pem, "PrivateKey", true),
         );
 
         let (cert_param, cert_arn) = cert?;
