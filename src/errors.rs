@@ -101,6 +101,9 @@ pub(crate) enum InvalidCertificateRequest {
 
     /// The SSM path specified was invalid.
     InvalidSsmParameterPath(String),
+
+    /// The SSM tier specified was invalid.
+    InvalidSsmTier(String),
 }
 
 impl InvalidCertificateRequest {
@@ -143,6 +146,10 @@ impl InvalidCertificateRequest {
     pub(crate) fn invalid_ssm_parameter_path<S: Into<String>>(path: S) -> Box<Self> {
         Box::new(Self::InvalidSsmParameterPath(path.into()))
     }
+
+    pub(crate) fn invalid_ssm_tier<S: Into<String>>(tier: S) -> Box<Self> {
+        Box::new(Self::InvalidSsmTier(tier.into()))
+    }
 }
 
 impl Display for InvalidCertificateRequest {
@@ -158,6 +165,7 @@ impl Display for InvalidCertificateRequest {
             Self::InvalidS3EncryptionAlgorithm(alg) => write!(f, "Invalid S3EncryptionAlgorithm: {}", alg),
             Self::InvalidS3Bucket(bucket) => write!(f, "Invalid S3 bucket: {}", bucket),
             Self::InvalidSsmParameterPath(path) => write!(f, "Invalid SSM parameter path: {}", path),
+            Self::InvalidSsmTier(tier) => write!(f, "Invalid SSM tier: {}", tier),
         }
     }
 }

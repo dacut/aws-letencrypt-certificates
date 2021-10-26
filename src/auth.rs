@@ -1,30 +1,37 @@
 use crate::{
-    constants::{CHALLENGE_TYPE_HTTP01, S3_ENCRYPTION_AES, S3_ENCRYPTION_KMS},
+    constants::{
+        CHALLENGE_TYPE_HTTP01, S3_ENCRYPTION_AES, S3_ENCRYPTION_KMS, SSM_TIER_ADVANCED, SSM_TIER_INTELLIGENT_TIERING,
+        SSM_TIER_STANDARD, SSM_TYPE_SECURE_STRING,
+    },
     errors::{CertificateRequestError, InvalidCertificateRequest},
-    utils::s3_bucket_location_constraint_to_region,
+    utils::{s3_bucket_location_constraint_to_region, ssm_acme_parameter_path},
 };
 use acme2::{Authorization, AuthorizationStatus, Challenge, ChallengeStatus};
 use lamedh_runtime::{self, Error as LambdaError};
 use log::{debug, error, info};
 use rusoto_core::Region;
 use rusoto_s3::{DeleteObjectRequest, GetBucketLocationRequest, PutObjectRequest, S3Client, S3};
+use rusoto_ssm::{DeleteParameterRequest, PutParameterRequest, Ssm, SsmClient};
 use serde::{self, Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "Type")]
 pub(crate) enum CertificateAuthorization {
+    HttpApiGateway(HttpApiGatewayAuthorization),
     HttpS3(HttpS3Authorization),
 }
 
 impl CertificateAuthorization {
     pub(crate) async fn setup(&mut self) -> Result<(), LambdaError> {
         match self {
+            Self::HttpApiGateway(inner) => inner.setup().await,
             Self::HttpS3(inner) => inner.setup().await,
         }
     }
 
     pub(crate) async fn auth(&self, auth: Authorization) -> Result<Option<Authorization>, LambdaError> {
         match self {
+            Self::HttpApiGateway(inner) => inner.auth(auth).await,
             Self::HttpS3(inner) => inner.auth(auth).await,
         }
     }
@@ -32,6 +39,7 @@ impl CertificateAuthorization {
     #[allow(dead_code)]
     pub(crate) async fn check(&self, auth: Authorization) -> Result<Option<Authorization>, LambdaError> {
         match self {
+            Self::HttpApiGateway(inner) => inner.check(auth).await,
             Self::HttpS3(inner) => inner.check(auth).await,
         }
     }
@@ -39,6 +47,7 @@ impl CertificateAuthorization {
     #[allow(dead_code)]
     pub(crate) async fn cleanup(&self, auth: Authorization) -> Result<(), LambdaError> {
         match self {
+            Self::HttpApiGateway(inner) => inner.cleanup(auth).await,
             Self::HttpS3(inner) => inner.cleanup(auth).await,
         }
     }
@@ -65,7 +74,7 @@ impl CertificateAuthorization {
 ///         // If EncryptionAlgorithm is "aws:kms", this KMS key will be used to encrypt the
 ///         // ACME HTTP-01 challenge written to S3. If unset, the default "aws/s3" key will be used.
 ///         "S3KmsKeyId": str
-///     },
+///     }
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct HttpS3Authorization {
     #[serde(rename = "Bucket")]
@@ -103,9 +112,7 @@ impl HttpS3Authorization {
             Some(prefix) => format!("{}.well-known/acme-challenge/{}", prefix, token),
         }
     }
-}
 
-impl HttpS3Authorization {
     pub(crate) async fn setup(&mut self) -> Result<(), LambdaError> {
         self.enc_alg = match &self.enc_alg {
             None => Some(S3_ENCRYPTION_AES.to_string()),
@@ -133,33 +140,10 @@ impl HttpS3Authorization {
         Ok(())
     }
 
-    fn get_challenge_token_for_auth(&self, auth: &Authorization) -> Result<(Challenge, String), LambdaError> {
-        let domain_name: &str = &auth.identifier.value;
-
-        // Look for the http-01 challenge.
-        let challenge = match auth.get_challenge(CHALLENGE_TYPE_HTTP01) {
-            Some(c) => c,
-            None => {
-                error!("No {} challenge found for {}", CHALLENGE_TYPE_HTTP01, domain_name);
-                return Err(CertificateRequestError::challenge_not_available(CHALLENGE_TYPE_HTTP01, domain_name));
-            }
-        };
-
-        let token = match &challenge.token {
-            Some(t) => t.clone(),
-            None => {
-                error!("No {} token found for {}", CHALLENGE_TYPE_HTTP01, domain_name);
-                return Err(CertificateRequestError::token_not_available(CHALLENGE_TYPE_HTTP01, domain_name));
-            }
-        };
-
-        Ok((challenge, token))
-    }
-
     pub(crate) async fn auth(&self, auth: Authorization) -> Result<Option<Authorization>, LambdaError> {
         debug!("Handling authorization: {:?}", auth);
         let domain_name: &str = &auth.identifier.value;
-        let (challenge, token) = self.get_challenge_token_for_auth(&auth)?;
+        let (challenge, token) = get_challenge_token_for_auth(&auth, CHALLENGE_TYPE_HTTP01)?;
 
         let key_auth = match challenge.key_authorization() {
             Ok(maybe_key_auth) => match maybe_key_auth {
@@ -168,7 +152,7 @@ impl HttpS3Authorization {
                     error!("No {} key authorization found for {}", CHALLENGE_TYPE_HTTP01, domain_name);
                     return Err(CertificateRequestError::token_not_available(CHALLENGE_TYPE_HTTP01, domain_name));
                 }
-            }
+            },
             Err(e) => {
                 error!("Failed to get ACME key authorization for {}: {}", domain_name, e);
                 return Err(Box::new(e));
@@ -199,7 +183,10 @@ impl HttpS3Authorization {
         match s3_client.put_object(po_request).await {
             Ok(_) => info!("Key authorization for {} written to s3://{}/{} written", domain_name, self.bucket, s3_key),
             Err(e) => {
-                error!("Failed to write key authorization for {} to s3://{}/{}: {}", domain_name, self.bucket, s3_key, e);
+                error!(
+                    "Failed to write key authorization for {} to s3://{}/{}: {}",
+                    domain_name, self.bucket, s3_key, e
+                );
                 return Err(Box::new(e));
             }
         }
@@ -219,12 +206,9 @@ impl HttpS3Authorization {
 
     pub(crate) async fn check(&self, auth: Authorization) -> Result<Option<Authorization>, LambdaError> {
         let domain_name: String = auth.identifier.value.clone();
-        let (challenge, _token) = self.get_challenge_token_for_auth(&auth)?;
+        let (challenge, _token) = get_challenge_token_for_auth(&auth, CHALLENGE_TYPE_HTTP01)?;
 
-        let (challenge_result, auth_result) = tokio::join!(
-            challenge.poll(),
-            auth.poll(),
-        );
+        let (challenge_result, auth_result) = tokio::join!(challenge.poll(), auth.poll(),);
 
         let challenge: Challenge = match challenge_result {
             Ok(c) => c,
@@ -268,7 +252,7 @@ impl HttpS3Authorization {
     }
 
     pub(crate) async fn cleanup(&self, auth: Authorization) -> Result<(), LambdaError> {
-        let (_, token) = self.get_challenge_token_for_auth(&auth)?;
+        let (_, token) = get_challenge_token_for_auth(&auth, CHALLENGE_TYPE_HTTP01)?;
         // Remove the challenge from S3.
         let s3_client = S3Client::new(self.region.as_ref().expect("Region not initialized").clone());
         let s3_key = self.get_s3_key_for_token(&token);
@@ -288,4 +272,204 @@ impl HttpS3Authorization {
             }
         }
     }
+}
+
+/// Configuration for HTTP-01 authorization using API Gateway to serve a website. In JSON:
+///
+///      {
+///         // The type of authorization to perform. This must be "HttpS3".
+///         "Type": "HttpApiGateway",
+///
+///         // The KMS key to use to encrypt the parameter value. If not specified, defaults to "aws/ssm"
+///         "KmsKeyId": str,
+///
+///         // The SSM tier to use to store the parameter. Allowed values are "Standard", "Advanced",  and
+///         // "Intelligent-Tiering". This defaults to the account default, which is "Standard" unless
+///         // UpdateServiceSetting has been called to change it.
+///         "SsmTier": str,
+///     }
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct HttpApiGatewayAuthorization {
+    #[serde(rename = "KmsKeyId")]
+    pub(crate) kms_key_id: Option<String>,
+
+    #[serde(rename = "SsmTier")]
+    pub(crate) ssm_tier: Option<String>,
+}
+
+impl HttpApiGatewayAuthorization {
+    pub(crate) async fn setup(&mut self) -> Result<(), LambdaError> {
+        match &self.ssm_tier {
+            None => (),
+            Some(value) => match value.as_ref() {
+                SSM_TIER_STANDARD | SSM_TIER_ADVANCED | SSM_TIER_INTELLIGENT_TIERING => (),
+                _ => return Err(InvalidCertificateRequest::invalid_ssm_tier(value)),
+            },
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn auth(&self, auth: Authorization) -> Result<Option<Authorization>, LambdaError> {
+        debug!("Handling authorization: {:?}", auth);
+        let domain_name: &str = &auth.identifier.value;
+        let (challenge, token) = get_challenge_token_for_auth(&auth, CHALLENGE_TYPE_HTTP01)?;
+
+        let key_auth = match challenge.key_authorization() {
+            Ok(maybe_key_auth) => match maybe_key_auth {
+                Some(ka) => ka,
+                None => {
+                    error!("No {} key authorization found for {}", CHALLENGE_TYPE_HTTP01, domain_name);
+                    return Err(CertificateRequestError::token_not_available(CHALLENGE_TYPE_HTTP01, domain_name));
+                }
+            },
+            Err(e) => {
+                error!("Failed to get ACME key authorization for {}: {}", domain_name, e);
+                return Err(Box::new(e));
+            }
+        };
+
+        // Write the challenge to SSM.
+        let ssm_client = SsmClient::new(Region::default());
+        let parameter_name = get_ssm_parameter_for_token(&token);
+
+        let ppr = PutParameterRequest {
+            description: Some(format!("Key authorization for {}", domain_name)),
+            key_id: self.kms_key_id.clone(),
+            name: parameter_name.clone(),
+            overwrite: Some(true),
+            tier: self.ssm_tier.clone(),
+            type_: Some(SSM_TYPE_SECURE_STRING.to_string()),
+            value: key_auth,
+            ..Default::default()
+        };
+
+        info!("Writing key authorization for {} to SSM parameter {}", domain_name, parameter_name);
+        match ssm_client.put_parameter(ppr).await {
+            Ok(_) => info!("Key authorization for {} written to SSM parameter {}", domain_name, parameter_name),
+            Err(e) => {
+                error!(
+                    "Failed to write key authorization for {} to SSM parameter {}: {}",
+                    domain_name, parameter_name, e
+                );
+                return Err(Box::new(e));
+            }
+        }
+
+        info!("Informing ACME server that http-01 validation is ready for  {}", domain_name);
+        // Signal to the ACME server that we're ready for verification.
+        match challenge.validate().await {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to send validation request to ACME server for {}: {}", domain_name, e);
+                return Err(Box::new(e));
+            }
+        };
+
+        self.check(auth).await
+    }
+
+    pub(crate) async fn check(&self, auth: Authorization) -> Result<Option<Authorization>, LambdaError> {
+        let domain_name: String = auth.identifier.value.clone();
+        let (challenge, _token) = get_challenge_token_for_auth(&auth, CHALLENGE_TYPE_HTTP01)?;
+
+        let (challenge_result, auth_result) = tokio::join!(challenge.poll(), auth.poll(),);
+
+        let challenge: Challenge = match challenge_result {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to update challenge status for {}: {}", domain_name, e);
+                return Err(Box::new(e));
+            }
+        };
+
+        let auth: Authorization = match auth_result {
+            Ok(a) => a,
+            Err(e) => {
+                error!("Failed to update authorization status for {}: {}", domain_name, e);
+                return Err(Box::new(e));
+            }
+        };
+
+        let challenge_valid: bool = match challenge.status {
+            ChallengeStatus::Invalid => {
+                error!("Challenge for {} is invalid", domain_name);
+                return Err(CertificateRequestError::challenge_failed(domain_name));
+            }
+            ChallengeStatus::Valid => true,
+            _ => false,
+        };
+
+        let auth_valid: bool = match auth.status {
+            AuthorizationStatus::Invalid => {
+                error!("Authorization for {} is invalid", domain_name);
+                return Err(CertificateRequestError::authorization_failed(domain_name));
+            }
+            AuthorizationStatus::Valid => true,
+            _ => false,
+        };
+
+        if challenge_valid && auth_valid {
+            Ok(None)
+        } else {
+            Ok(Some(auth))
+        }
+    }
+
+    pub(crate) async fn cleanup(&self, auth: Authorization) -> Result<(), LambdaError> {
+        let (_, token) = get_challenge_token_for_auth(&auth, CHALLENGE_TYPE_HTTP01)?;
+        // Remove the challenge from SSM.
+        let ssm_client = SsmClient::new(Region::default());
+        let parameter_name = get_ssm_parameter_for_token(&token);
+
+        let dpr = DeleteParameterRequest {
+            name: parameter_name.clone(),
+            ..Default::default()
+        };
+
+        info!("Removing key authorization from SSM parameter {}", parameter_name);
+        match ssm_client.delete_parameter(dpr).await {
+            Ok(_) => {
+                info!("Removed authorization from SSM parameter {}", parameter_name);
+                Ok(())
+            }
+            Err(e) => {
+                error!(
+                    "Failed to delete key authorization from SSM parameter {}: {}",
+                    parameter_name, e
+                );
+                Err(Box::new(e))
+            }
+        }
+    }
+}
+
+fn get_challenge_token_for_auth(
+    auth: &Authorization,
+    challenge_type: &str,
+) -> Result<(Challenge, String), LambdaError> {
+    let domain_name: &str = &auth.identifier.value;
+
+    // Look for the http-01 challenge.
+    let challenge = match auth.get_challenge(challenge_type) {
+        Some(c) => c,
+        None => {
+            error!("No {} challenge found for {}", challenge_type, domain_name);
+            return Err(CertificateRequestError::challenge_not_available(challenge_type, domain_name));
+        }
+    };
+
+    let token = match &challenge.token {
+        Some(t) => t.clone(),
+        None => {
+            error!("No {} token found for {}", challenge_type, domain_name);
+            return Err(CertificateRequestError::token_not_available(challenge_type, domain_name));
+        }
+    };
+
+    Ok((challenge, token))
+}
+
+fn get_ssm_parameter_for_token(token: &str) -> String {
+    format!("{}/AcmeChallenge/{}", ssm_acme_parameter_path(), token)
 }
