@@ -3,8 +3,8 @@ use {
         constants::{ACM_STATUS_EXPIRED, ACM_STATUS_ISSUED, ACM_TYPE_IMPORTED, S3_ENCRYPTION_AES, S3_ENCRYPTION_KMS},
         errors::{CertificateRequestError, InvalidCertificateRequest},
         utils::{
-            CertificateComponents,
-            default_aes256, default_false, empty_string, s3_bucket_location_constraint_to_region, validate_and_sanitize_ssm_parameter_path,
+            default_aes256, default_false, empty_string, s3_bucket_location_constraint_to_region,
+            validate_and_sanitize_ssm_parameter_path, CertificateComponents,
         },
     },
     bytes::Bytes,
@@ -12,19 +12,14 @@ use {
         future::ready,
         stream::{FuturesOrdered, StreamExt},
     },
-    lamedh_runtime::Error as LambdaError,
-    log::{error, info},
-    rusoto_acm::{
-        Acm, AcmClient, DescribeCertificateRequest, ImportCertificateRequest,
-        ListCertificatesRequest,
-    },
+    lambda_runtime::Error as LambdaError,
+    log::{debug, error, info},
+    rusoto_acm::{Acm, AcmClient, DescribeCertificateRequest, ImportCertificateRequest, ListCertificatesRequest},
     rusoto_core::Region,
-    rusoto_s3::{GetBucketLocationRequest, PutObjectRequest, S3Client, S3, StreamingBody},
+    rusoto_s3::{GetBucketLocationRequest, PutObjectRequest, S3Client, StreamingBody, S3},
     rusoto_ssm::{GetParameterRequest, PutParameterRequest, Ssm, SsmClient},
     serde::{self, Deserialize, Serialize},
-    std::{
-        str::FromStr,
-    },
+    std::str::FromStr,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -47,18 +42,12 @@ impl CertificateStorage {
     pub(crate) async fn save_certificate(
         &self,
         domain_names: Vec<String>,
-        components: CertificateComponents
+        components: CertificateComponents,
     ) -> Result<Vec<CertificateStorageResult>, LambdaError> {
         match self {
-            CertificateStorage::Acm(storage) => {
-                storage.save_certificate(domain_names, components).await
-            }
-            CertificateStorage::S3(storage) => {
-                storage.save_certificate(domain_names, components).await
-            }
-            CertificateStorage::SsmParameter(storage) => {
-                storage.save_certificate(domain_names, components).await
-            }
+            CertificateStorage::Acm(storage) => storage.save_certificate(domain_names, components).await,
+            CertificateStorage::S3(storage) => storage.save_certificate(domain_names, components).await,
+            CertificateStorage::SsmParameter(storage) => storage.save_certificate(domain_names, components).await,
         }
     }
 }
@@ -122,7 +111,7 @@ impl AcmStorage {
     pub(crate) async fn save_certificate(
         &self,
         domain_names: Vec<String>,
-        components: CertificateComponents
+        components: CertificateComponents,
     ) -> Result<Vec<CertificateStorageResult>, LambdaError> {
         if self.force_new_import {
             self.import_new_certificate(domain_names, components).await
@@ -146,6 +135,8 @@ impl AcmStorage {
         };
         let mut candidates = Vec::new();
 
+        debug!("Looking for existing certificates that match: {}", domain_names.join(" "));
+
         loop {
             match acm.list_certificates(lc_request.clone()).await {
                 Err(e) => {
@@ -155,11 +146,19 @@ impl AcmStorage {
                 Ok(resp) => {
                     if let Some(summaries) = resp.certificate_summary_list {
                         for summary in summaries {
+                            debug!(
+                                "Considering certificate {} with domain name {}",
+                                summary.certificate_arn.as_ref().map(|s| s.as_str()).unwrap_or("<unknown>"),
+                                summary.domain_name.as_ref().map(|s| s.as_str()).unwrap_or("<unknown>")
+                            );
+
                             if let Some(summary_domain_name) = summary.domain_name {
-                                if summary_domain_name == domain_names[0] {
-                                    let summary_cert_arn = summary.certificate_arn.unwrap();
-                                    info!("Found existing certificate {}", summary_cert_arn);
-                                    candidates.push(summary_cert_arn);
+                                for domain_name in domain_names {
+                                    if summary_domain_name == domain_name.as_str() {
+                                        let summary_cert_arn = summary.certificate_arn.as_ref().unwrap().clone();
+                                        info!("Certificate {} is a possible candidate", summary_cert_arn);
+                                        candidates.push(summary_cert_arn);
+                                    }
                                 }
                             }
                         }
@@ -224,7 +223,7 @@ impl AcmStorage {
     async fn import_new_certificate(
         &self,
         domain_names: Vec<String>,
-        components: CertificateComponents
+        components: CertificateComponents,
     ) -> Result<Vec<CertificateStorageResult>, LambdaError> {
         info!("Importing certificate to ACM for {}", domain_names.join(" "));
         let acm = AcmClient::new(Region::default());
@@ -259,7 +258,7 @@ impl AcmStorage {
     ) -> Result<Vec<CertificateStorageResult>, LambdaError> {
         let mut futures = FuturesOrdered::new();
         let n_arns = domain_names.len();
-        
+
         for arn in existing_arns {
             futures.push(self.reimport_certificate_for_arn(domain_names.clone(), arn, components.clone()));
         }
@@ -268,7 +267,9 @@ impl AcmStorage {
 
         while let Some(result) = futures.next().await {
             match result {
-                Ok(arn) => results.push(CertificateStorageResult::Acm(AcmStorageResult { certificate_arn: arn })),
+                Ok(arn) => results.push(CertificateStorageResult::Acm(AcmStorageResult {
+                    certificate_arn: arn,
+                })),
                 Err(e) => {
                     error!("Failed to reimport certificate: {:#}", e);
                     results.push(CertificateStorageResult::Error(format!("Failed to reimport certificate: {:#}", e)));
@@ -278,12 +279,12 @@ impl AcmStorage {
 
         Ok(results)
     }
-    
+
     async fn reimport_certificate_for_arn(
         &self,
         domain_names: Vec<String>,
         cert_arn: String,
-        components: CertificateComponents
+        components: CertificateComponents,
     ) -> Result<String, LambdaError> {
         info!("Reimporting certificate for {} over {}", domain_names.join(" "), cert_arn);
         let acm = AcmClient::new(Region::default());
@@ -295,7 +296,7 @@ impl AcmStorage {
             tags: None,
         };
 
-        match acm.import_certificate(imp_req).await {            
+        match acm.import_certificate(imp_req).await {
             Err(e) => {
                 error!("Failed to reimport certificate: {:#}", e);
                 Err(Box::new(e))
@@ -321,17 +322,17 @@ impl AcmStorage {
 ///         // The prefix to use for the certificate keys. Note that a "/" is not automatically
 ///         // appended.
 ///         "Prefix": str,
-/// 
+///
 ///         // The encryption type to use for the certificate components. This must be either "AES256" or "aws:kms". This defaults to "AES256".
 ///         "ComponentEncryptionType": str,
-/// 
+///
 ///         // If ComponentEncryptionType is "aws:kms", this is the KMS key ARN to use for encryption. If
 ///         // not specified, the default "aws/s3" key is used.
 ///         "ComponentKmsKey": str,
-/// 
+///
 ///         // The encryption type to use for the private key. This must be either "AES256" or "aws:kms". This defaults to "AES256".
 ///         "PrivateKeyEncryptionType": str,
-/// 
+///
 ///         // If PrivateKeyEncryptionType is "aws:kms", this is the KMS key ARN to use for encryption. If
 ///         // not specified, the default "aws/s3" key is used.
 ///         "PrivateKeyKmsKey": str,
@@ -413,7 +414,7 @@ impl S3Storage {
         let pkey_key = format!("{}privkey.pem", self.prefix);
 
         info!("Saving certificate for {} to s3://{}/{}", domain_names.join(" "), self.bucket, cert_key);
-        let cert_por = PutObjectRequest{
+        let cert_por = PutObjectRequest {
             bucket: self.bucket.clone(),
             key: cert_key.clone(),
             server_side_encryption: Some(self.component_encryption_type.clone()),
@@ -423,7 +424,7 @@ impl S3Storage {
         };
 
         info!("Saving certificate chain for {} to s3://{}/{}", domain_names.join(" "), self.bucket, chain_key);
-        let chain_por = PutObjectRequest{
+        let chain_por = PutObjectRequest {
             bucket: self.bucket.clone(),
             key: chain_key.clone(),
             server_side_encryption: Some(self.component_encryption_type.clone()),
@@ -433,7 +434,7 @@ impl S3Storage {
         };
 
         info!("Saving certificate fullchain for {} to s3://{}/{}", domain_names.join(" "), self.bucket, fullchain_key);
-        let fullchain_por = PutObjectRequest{
+        let fullchain_por = PutObjectRequest {
             bucket: self.bucket.clone(),
             key: fullchain_key.clone(),
             server_side_encryption: Some(self.component_encryption_type.clone()),
@@ -443,7 +444,7 @@ impl S3Storage {
         };
 
         info!("Saving private key for {} to s3://{}/{}", domain_names.join(" "), self.bucket, pkey_key);
-        let pkey_por = PutObjectRequest{
+        let pkey_por = PutObjectRequest {
             bucket: self.bucket.clone(),
             key: pkey_key.clone(),
             server_side_encryption: Some(self.pkey_encryption_type.clone()),
@@ -451,7 +452,7 @@ impl S3Storage {
             body: Some(StreamingBody::from(components.pkey_pem.into_bytes())),
             ..Default::default()
         };
-        
+
         let (cert_result, chain_result, fullchain_result, pkey_result) = tokio::join!(
             s3_client.put_object(cert_por),
             s3_client.put_object(chain_por),
@@ -606,7 +607,7 @@ impl SsmParameterStorage {
                         error!("Unable to get ARN for parameter {}: {}", param_name, e);
                         Err(CertificateRequestError::unexpected_aws_response(format!(
                             "Unable to get ARN for parameter {}: {}",
-                            param_name, e   
+                            param_name, e
                         )))
                     }
                 }

@@ -7,13 +7,14 @@ use {
     acme2::{Authorization, AuthorizationStatus, Challenge, ChallengeStatus},
     async_trait::async_trait,
     base64,
-    lamedh_runtime::{self, Error as LambdaError},
+    lambda_runtime::Error as LambdaError,
     log::{debug, error, info},
-    ring::digest::{digest, SHA256   },
+    ring::digest::{digest, SHA256},
     rusoto_core::Region,
     rusoto_route53::{
         Change, ChangeBatch, ChangeResourceRecordSetsRequest, GetChangeRequest, GetHostedZoneRequest, HostedZone,
-        ListHostedZonesRequest, ResourceRecord, ResourceRecordSet, Route53, Route53Client, ListResourceRecordSetsRequest,
+        ListHostedZonesRequest, ListResourceRecordSetsRequest, ResourceRecord, ResourceRecordSet, Route53,
+        Route53Client,
     },
     serde::{self, Deserialize, Serialize},
     std::{str::FromStr, time::Duration},
@@ -115,8 +116,13 @@ impl DnsRoute53Authorization {
         }
     }
 
-    async fn remove_existing_records(&self, route53_client: &mut Route53Client, hosted_zone_id: &str, record_name: &str) -> Result<(), LambdaError> {
-        let mut lrrsi = ListResourceRecordSetsRequest{
+    async fn remove_existing_records(
+        &self,
+        route53_client: &mut Route53Client,
+        hosted_zone_id: &str,
+        record_name: &str,
+    ) -> Result<(), LambdaError> {
+        let mut lrrsi = ListResourceRecordSetsRequest {
             hosted_zone_id: hosted_zone_id.to_string(),
             start_record_name: Some(record_name.to_string()),
             start_record_type: Some("TXT".to_string()),
@@ -136,7 +142,10 @@ impl DnsRoute53Authorization {
                     break 'list_records;
                 }
 
-                records_to_delete.push(Change{action: "DELETE".to_string(), resource_record_set: resource_record});
+                records_to_delete.push(Change {
+                    action: "DELETE".to_string(),
+                    resource_record_set: resource_record,
+                });
             }
 
             match lrrso.next_record_name {
@@ -150,15 +159,18 @@ impl DnsRoute53Authorization {
                 Some(ref nrt) if nrt.as_str() != "TXT" => break,
                 _ => (),
             }
-            
+
             lrrsi.start_record_identifier = lrrso.next_record_identifier;
         }
 
         if records_to_delete.len() > 0 {
             info!("Deleting {} record(s) from {}", records_to_delete.len(), hosted_zone_id);
-            let crrsi = ChangeResourceRecordSetsRequest{
+            let crrsi = ChangeResourceRecordSetsRequest {
                 hosted_zone_id: hosted_zone_id.to_string(),
-                change_batch: ChangeBatch{changes: records_to_delete, comment: None},
+                change_batch: ChangeBatch {
+                    changes: records_to_delete,
+                    comment: None,
+                },
             };
 
             let crrso = route53_client.change_resource_record_sets(crrsi).await?;
@@ -168,11 +180,15 @@ impl DnsRoute53Authorization {
             info!("Sleeping for 10 seconds to let Route 53 settle down");
             sleep(Duration::from_secs(10)).await;
         }
-        
+
         Ok(())
     }
 
-    async fn wait_for_change_sync(&self, route53_client: &mut Route53Client, change_id: &str) -> Result<(), LambdaError> {
+    async fn wait_for_change_sync(
+        &self,
+        route53_client: &mut Route53Client,
+        change_id: &str,
+    ) -> Result<(), LambdaError> {
         // Due to a rusoto bug, we need to trim leading slashes from the change id.
         let gci = GetChangeRequest {
             id: change_id.trim_start_matches('/').to_string(),

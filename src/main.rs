@@ -27,11 +27,11 @@ use {
         },
     },
     http::{HeaderMap, HeaderValue},
-    lamedh_runtime::{self, Context, Error as LambdaError},
+    lambda_runtime::{self, Error as LambdaError, LambdaEvent},
     log::{error, info},
     rusoto_core::Region,
     rusoto_ssm::{GetParameterRequest, Ssm, SsmClient},
-    serde::{self, Deserialize, Serialize},
+    serde::{Deserialize, Serialize},
     serde_json::{Deserializer as JsonDeserializer, Serializer as JsonSerializer, Value},
     url::Url,
 };
@@ -40,15 +40,16 @@ use {
 #[tokio::main]
 async fn main() {
     env_logger::init();
-    let f = lamedh_runtime::handler_fn(handler_main);
-    match lamedh_runtime::run(f).await {
-        Ok(()) => println!("lamedh_runtime exited successfully"),
-        Err(e) => eprintln!("lamedh_runtime failed: {:#}", e),
+    let service = lambda_runtime::service_fn(handler_main);
+    match lambda_runtime::run(service).await {
+        Ok(()) => println!("lambda_runtime exited successfully"),
+        Err(e) => eprintln!("lambda_runtime failed: {:#}", e),
     }
 }
 
 /// Entrypoint for Lambda events.
-async fn handler_main(basic: Value, _context: Context) -> Result<Response, LambdaError> {
+async fn handler_main(req_and_context: LambdaEvent<Value>) -> Result<Response, LambdaError> {
+    let basic = req_and_context.payload;
     eprintln!("Incoming value: {}", basic);
     let basic_bytes = Vec::new();
     let mut ser = JsonSerializer::new(basic_bytes);

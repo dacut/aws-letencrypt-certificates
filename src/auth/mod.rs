@@ -9,9 +9,9 @@ use {
     crate::errors::CertificateRequestError,
     acme2::{Authorization, Challenge},
     async_trait::async_trait,
-    lamedh_runtime::{self, Error as LambdaError},
+    lambda_runtime::Error as LambdaError,
     log::error,
-    serde::{self, Deserialize, Serialize},
+    serde::{Deserialize, Serialize},
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -27,7 +27,8 @@ pub(crate) trait AuthorizationHandler {
     async fn setup(&mut self) -> Result<(), LambdaError> {
         Ok(())
     }
-    async fn auth(&self, auth: Authorization) -> Result<(Authorization, Challenge, Vec<CleanupDirective>), LambdaError>;
+    async fn auth(&self, auth: Authorization)
+        -> Result<(Authorization, Challenge, Vec<CleanupDirective>), LambdaError>;
     async fn check(
         &self,
         auth: Authorization,
@@ -48,7 +49,10 @@ impl AuthorizationHandler for CertificateAuthorization {
         }
     }
 
-    async fn auth(&self, auth: Authorization) -> Result<(Authorization, Challenge, Vec<CleanupDirective>), LambdaError> {
+    async fn auth(
+        &self,
+        auth: Authorization,
+    ) -> Result<(Authorization, Challenge, Vec<CleanupDirective>), LambdaError> {
         match self {
             Self::DnsRoute53(inner) => inner.auth(auth).await,
             Self::HttpApiGateway(inner) => inner.auth(auth).await,
@@ -79,7 +83,7 @@ impl AuthorizationHandler for CertificateAuthorization {
 
 #[derive(Debug)]
 pub(crate) enum CleanupDirective {
-    DeleteRoute53Record{
+    DeleteRoute53Record {
         hosted_zone_id: String,
         record_name: String,
         record_type: String,
@@ -87,12 +91,12 @@ pub(crate) enum CleanupDirective {
         ttl: i64,
     },
 
-    DeleteS3Object{
+    DeleteS3Object {
         bucket: String,
         key: String,
     },
 
-    DeleteSSMParameter{
+    DeleteSSMParameter {
         parameter_name: String,
     },
 }

@@ -10,12 +10,12 @@ use {
     },
     acme2::{Authorization, AuthorizationStatus, Challenge, ChallengeStatus},
     async_trait::async_trait,
-    lamedh_runtime::{self, Error as LambdaError},
+    lambda_runtime::Error as LambdaError,
     log::{debug, error, info},
     rusoto_core::Region,
     rusoto_s3::{DeleteObjectRequest, GetBucketLocationRequest, PutObjectRequest, S3Client, S3},
     rusoto_ssm::{DeleteParameterRequest, PutParameterRequest, Ssm, SsmClient},
-    serde::{self, Deserialize, Serialize},
+    serde::{Deserialize, Serialize},
 };
 
 /// Configuration for HTTP-01 authorization using S3 to serve a website. In JSON:
@@ -172,7 +172,10 @@ impl AuthorizationHandler for HttpS3Authorization {
             }
         };
 
-        let cleanup = vec![CleanupDirective::DeleteS3Object{bucket:self.bucket.clone(), key:s3_key}];
+        let cleanup = vec![CleanupDirective::DeleteS3Object {
+            bucket: self.bucket.clone(),
+            key: s3_key,
+        }];
 
         Ok((auth, challenge, cleanup))
     }

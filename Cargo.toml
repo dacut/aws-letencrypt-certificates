@@ -15,9 +15,8 @@ bytes = "^1.0"
 env_logger = "^0.9"
 futures = "^0.3"
 http = "^0.2"
-lamedh_attributes = { version = "^0.3" }
-lamedh_http = { version = "^0.3" }
-lamedh_runtime = { version = "^0.3" }
+lambda_http = { version = "^0.5" }
+lambda_runtime = { version = "^0.5" }
 lazy_static = "^1.4"
 log = "^0.4"
 openssl = "^0.10"

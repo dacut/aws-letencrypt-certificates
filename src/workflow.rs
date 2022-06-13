@@ -6,9 +6,11 @@ use {
         storage::{CertificateStorage, CertificateStorageResult},
         utils::{ssm_acme_parameter_path, CertificateComponents},
     },
-    acme2::{Account, AccountBuilder, Authorization, Csr, Directory, DirectoryBuilder, Order, OrderBuilder, OrderStatus},
+    acme2::{
+        Account, AccountBuilder, Authorization, Csr, Directory, DirectoryBuilder, Order, OrderBuilder, OrderStatus,
+    },
     futures::stream::{FuturesOrdered, StreamExt},
-    lamedh_runtime::{self, Error as LambdaError},
+    lambda_runtime::Error as LambdaError,
     log::{debug, error, info},
     openssl::{
         pkey::{PKey, Private},
@@ -89,7 +91,7 @@ impl ValidatedCertificateRequest {
 
         // Wait until the order is ready to be finalized.
         let order = order.wait_ready(CHECK_WAIT_DURATION, MAX_ORDER_RETRIES).await?;
-        
+
         match &order.status {
             OrderStatus::Invalid => {
                 error!("Order has become invalid");
@@ -383,14 +385,14 @@ impl ValidatedCertificateRequest {
     async fn save_certificates(&self, components: CertificateComponents) -> Result<Response, LambdaError> {
         let mut n_successes = 0u32;
         let mut n_failures = 0u32;
-    
+
         let mut futures = FuturesOrdered::new();
         for storage_provider in &self.storage {
             futures.push(storage_provider.save_certificate(self.domain_names.clone(), components.clone()));
         }
-    
+
         let mut results = Vec::new();
-    
+
         while let Some(result) = futures.next().await {
             match result {
                 Ok(result_set) => {
@@ -399,7 +401,7 @@ impl ValidatedCertificateRequest {
                             CertificateStorageResult::Error(_) => n_failures += 1,
                             _ => n_successes += 1,
                         }
-    
+
                         results.push(result);
                     }
                 }
@@ -410,7 +412,7 @@ impl ValidatedCertificateRequest {
                 }
             }
         }
-    
+
         let status = if n_failures > 0 {
             if n_successes > 0 {
                 CertificateResponseStatus::PartialSuccess
@@ -420,7 +422,7 @@ impl ValidatedCertificateRequest {
         } else {
             CertificateResponseStatus::Success
         };
-    
+
         let cr = CertificateResponse {
             finished: true,
             status,
