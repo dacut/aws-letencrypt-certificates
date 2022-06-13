@@ -1,13 +1,23 @@
-use crate::{
-    auth::CertificateAuthorization,
-    storage::{CertificateStorage, CertificateStorageResult},
+use {
+    crate::{
+        auth::CertificateAuthorization,
+        storage::{CertificateStorage, CertificateStorageResult},
+    },
+    aws_lambda_events::event::{
+        alb::{AlbTargetGroupRequest, AlbTargetGroupResponse},
+        apigw::{ApiGatewayProxyRequest, ApiGatewayProxyResponse, ApiGatewayV2httpRequest, ApiGatewayV2httpResponse},
+    },
+    serde::{
+        self,
+        de::{
+            self,
+            value::{MapAccessDeserializer, SeqAccessDeserializer},
+            Deserializer, MapAccess, SeqAccess, Visitor,
+        },
+        Deserialize, Serialize,
+    },
+    std::fmt::{Formatter, Result as FmtResult},
 };
-use acme2::Order;
-use aws_lambda_events::event::{
-    alb::{AlbTargetGroupRequest, AlbTargetGroupResponse},
-    apigw::{ApiGatewayProxyRequest, ApiGatewayProxyResponse, ApiGatewayV2httpRequest, ApiGatewayV2httpResponse},
-};
-use serde::{self, Deserialize, Serialize};
 
 /// The incoming Lambda request.
 ///
@@ -53,20 +63,17 @@ pub(crate) struct CertificateRequest {
     #[serde(rename = "Directory")]
     pub(crate) directory: String,
 
-    #[serde(rename = "DomainNames")]
+    #[serde(rename = "DomainNames", deserialize_with = "string_or_vec")]
     pub(crate) domain_names: Vec<String>,
 
-    #[serde(rename = "Contacts")]
+    #[serde(rename = "Contacts", deserialize_with = "string_or_vec")]
     pub(crate) contacts: Vec<String>,
 
     #[serde(rename = "Authorization")]
     pub(crate) auth: CertificateAuthorization,
 
-    #[serde(rename = "Storage")]
+    #[serde(rename = "Storage", deserialize_with = "cert_storage_or_vec")]
     pub(crate) storage: Vec<CertificateStorage>,
-
-    #[serde(rename = "State")]
-    pub(crate) state: Option<ValidationState>,
 }
 
 /// The types of responses we can send back.
@@ -125,9 +132,6 @@ pub(crate) struct CertificateResponse {
 
     #[serde(rename = "StorageResults")]
     pub(crate) storage: Vec<CertificateStorageResult>,
-
-    #[serde(rename = "State")]
-    pub(crate) state: Option<ValidationState>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -140,14 +144,120 @@ pub(crate) enum CertificateResponseStatus {
     Failed,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct ValidationState {
-    #[serde(rename = "Order")]
-    pub(crate) order: Order,
+/// StringOrVec allows a string or a list of strings to be passed via JSON.
+struct StringOrVec;
+impl<'de> Visitor<'de> for StringOrVec {
+    type Value = Vec<String>;
 
-    #[serde(rename = "PrivateKey")]
-    pub(crate) private_key: Option<String>,
+    fn expecting(&self, formatter: &mut Formatter) -> FmtResult {
+        formatter.write_str("string or list of strings")
+    }
 
-    #[serde(rename = "NumTries")]
-    pub(crate) n_tries: u32,
+    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(vec![s.to_owned()])
+    }
+
+    fn visit_seq<S>(self, seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        Deserialize::deserialize(SeqAccessDeserializer::new(seq))
+    }
+}
+
+/// string_or_vec is a helper function to deserialize a string or a list of strings.
+fn string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_any(StringOrVec)
+}
+
+/// CertStorageOrVec allows a CertificateStorage or a list of CertificateStorage objects to be passed via JSON.
+struct CertStorageOrVec;
+impl<'de> Visitor<'de> for CertStorageOrVec {
+    type Value = Vec<CertificateStorage>;
+
+    fn expecting(&self, formatter: &mut Formatter) -> FmtResult {
+        formatter.write_str("CertificateStorage or list of CertificateStorage objects")
+    }
+
+    fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        Deserialize::deserialize(MapAccessDeserializer::new(map))
+    }
+
+    fn visit_seq<S>(self, seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        Deserialize::deserialize(SeqAccessDeserializer::new(seq))
+    }
+}
+
+/// cert_or_vec is a helper function to deserialize a CertificateStorage object or a list of CertificateStorage objects
+fn cert_storage_or_vec<'de, D>(deserializer: D) -> Result<Vec<CertificateStorage>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_any(CertStorageOrVec)
+}
+
+#[allow(unused_imports, dead_code)]
+mod test {
+    use {
+        super::{CertificateRequest, Request},
+        log::LevelFilter,
+    };
+
+    const BASIC_CERT_REQUEST: &str = r#"{
+    "Directory": "https://acme-staging-v02.api.letsencrypt.org/directory",
+    "DomainNames": ["example.com"],
+    "Contacts": ["mailto:hello@example.com"],
+    "Authorization": {
+        "Type": "DnsRoute53"
+    },
+    "Storage": [
+        {
+            "Type": "Acm"
+        }
+    ]
+}"#;
+
+    const NON_LIST_REQUEST: &str = r#"{
+        "Directory": "https://acme-staging-v02.api.letsencrypt.org/directory",
+        "DomainNames": "example.com",
+        "Contacts": "mailto:hello@example.com",
+        "Authorization": {
+            "Type": "DnsRoute53"
+        },
+        "Storage": {
+            "Type": "Acm"
+        }
+    }"#;
+
+    #[tokio::test]
+    async fn test_deser_basic_certificate_request() {
+        env_logger::builder().filter_level(LevelFilter::Debug).init();
+        let result = serde_json::from_str::<CertificateRequest>(&BASIC_CERT_REQUEST);
+        assert!(result.is_ok(), "Error: {:?}", result);
+
+        let result = serde_json::from_str::<Request>(&BASIC_CERT_REQUEST);
+        assert!(result.is_ok(), "Error: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_deser_non_list_certificate_request() {
+        env_logger::builder().filter_level(LevelFilter::Debug).init();
+        let result = serde_json::from_str::<CertificateRequest>(&NON_LIST_REQUEST);
+        assert!(result.is_ok(), "Error: {:?}", result);
+
+        let result = serde_json::from_str::<Request>(&NON_LIST_REQUEST);
+        assert!(result.is_ok(), "Error: {:?}", result);
+    }
 }

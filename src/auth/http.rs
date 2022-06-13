@@ -1,57 +1,22 @@
-use crate::{
-    constants::{
-        CHALLENGE_TYPE_HTTP01, S3_ENCRYPTION_AES, S3_ENCRYPTION_KMS, SSM_TIER_ADVANCED, SSM_TIER_INTELLIGENT_TIERING,
-        SSM_TIER_STANDARD, SSM_TYPE_SECURE_STRING,
+use {
+    super::{get_challenge_token_for_auth, AuthorizationHandler, CleanupDirective},
+    crate::{
+        constants::{
+            CHALLENGE_TYPE_HTTP01, S3_ENCRYPTION_AES, S3_ENCRYPTION_KMS, SSM_TIER_ADVANCED,
+            SSM_TIER_INTELLIGENT_TIERING, SSM_TIER_STANDARD, SSM_TYPE_SECURE_STRING,
+        },
+        errors::{CertificateRequestError, InvalidCertificateRequest},
+        utils::{s3_bucket_location_constraint_to_region, ssm_acme_parameter_path},
     },
-    errors::{CertificateRequestError, InvalidCertificateRequest},
-    utils::{s3_bucket_location_constraint_to_region, ssm_acme_parameter_path},
+    acme2::{Authorization, AuthorizationStatus, Challenge, ChallengeStatus},
+    async_trait::async_trait,
+    lamedh_runtime::{self, Error as LambdaError},
+    log::{debug, error, info},
+    rusoto_core::Region,
+    rusoto_s3::{DeleteObjectRequest, GetBucketLocationRequest, PutObjectRequest, S3Client, S3},
+    rusoto_ssm::{DeleteParameterRequest, PutParameterRequest, Ssm, SsmClient},
+    serde::{self, Deserialize, Serialize},
 };
-use acme2::{Authorization, AuthorizationStatus, Challenge, ChallengeStatus};
-use lamedh_runtime::{self, Error as LambdaError};
-use log::{debug, error, info};
-use rusoto_core::Region;
-use rusoto_s3::{DeleteObjectRequest, GetBucketLocationRequest, PutObjectRequest, S3Client, S3};
-use rusoto_ssm::{DeleteParameterRequest, PutParameterRequest, Ssm, SsmClient};
-use serde::{self, Deserialize, Serialize};
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "Type")]
-pub(crate) enum CertificateAuthorization {
-    HttpApiGateway(HttpApiGatewayAuthorization),
-    HttpS3(HttpS3Authorization),
-}
-
-impl CertificateAuthorization {
-    pub(crate) async fn setup(&mut self) -> Result<(), LambdaError> {
-        match self {
-            Self::HttpApiGateway(inner) => inner.setup().await,
-            Self::HttpS3(inner) => inner.setup().await,
-        }
-    }
-
-    pub(crate) async fn auth(&self, auth: Authorization) -> Result<Option<Authorization>, LambdaError> {
-        match self {
-            Self::HttpApiGateway(inner) => inner.auth(auth).await,
-            Self::HttpS3(inner) => inner.auth(auth).await,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn check(&self, auth: Authorization) -> Result<Option<Authorization>, LambdaError> {
-        match self {
-            Self::HttpApiGateway(inner) => inner.check(auth).await,
-            Self::HttpS3(inner) => inner.check(auth).await,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn cleanup(&self, auth: Authorization) -> Result<(), LambdaError> {
-        match self {
-            Self::HttpApiGateway(inner) => inner.cleanup(auth).await,
-            Self::HttpS3(inner) => inner.cleanup(auth).await,
-        }
-    }
-}
 
 /// Configuration for HTTP-01 authorization using S3 to serve a website. In JSON:
 ///
@@ -80,13 +45,13 @@ pub(crate) struct HttpS3Authorization {
     #[serde(rename = "Bucket")]
     pub(crate) bucket: String,
 
-    #[serde(rename = "Prefix")]
+    #[serde(rename = "Prefix", default)]
     pub(crate) prefix: Option<String>,
 
-    #[serde(rename = "EncryptionAlgorithm")]
+    #[serde(rename = "EncryptionAlgorithm", default)]
     pub(crate) enc_alg: Option<String>,
 
-    #[serde(rename = "KmsKeyId")]
+    #[serde(rename = "KmsKeyId", default)]
     pub(crate) kms_key_id: Option<String>,
 
     #[serde(skip)]
@@ -112,8 +77,11 @@ impl HttpS3Authorization {
             Some(prefix) => format!("{}.well-known/acme-challenge/{}", prefix, token),
         }
     }
+}
 
-    pub(crate) async fn setup(&mut self) -> Result<(), LambdaError> {
+#[async_trait]
+impl AuthorizationHandler for HttpS3Authorization {
+    async fn setup(&mut self) -> Result<(), LambdaError> {
         self.enc_alg = match &self.enc_alg {
             None => Some(S3_ENCRYPTION_AES.to_string()),
             Some(alg_name) => match alg_name.as_ref() {
@@ -140,7 +108,10 @@ impl HttpS3Authorization {
         Ok(())
     }
 
-    pub(crate) async fn auth(&self, auth: Authorization) -> Result<Option<Authorization>, LambdaError> {
+    async fn auth(
+        &self,
+        auth: Authorization,
+    ) -> Result<(Authorization, Challenge, Vec<CleanupDirective>), LambdaError> {
         debug!("Handling authorization: {:?}", auth);
         let domain_name: &str = &auth.identifier.value;
         let (challenge, token) = get_challenge_token_for_auth(&auth, CHALLENGE_TYPE_HTTP01)?;
@@ -201,13 +172,17 @@ impl HttpS3Authorization {
             }
         };
 
-        self.check(auth).await
+        let cleanup = vec![CleanupDirective::DeleteS3Object{bucket:self.bucket.clone(), key:s3_key}];
+
+        Ok((auth, challenge, cleanup))
     }
 
-    pub(crate) async fn check(&self, auth: Authorization) -> Result<Option<Authorization>, LambdaError> {
+    async fn check(
+        &self,
+        auth: Authorization,
+        challenge: Challenge,
+    ) -> Result<(Authorization, Challenge, bool), LambdaError> {
         let domain_name: String = auth.identifier.value.clone();
-        let (challenge, _token) = get_challenge_token_for_auth(&auth, CHALLENGE_TYPE_HTTP01)?;
-
         let (challenge_result, auth_result) = tokio::join!(challenge.poll(), auth.poll(),);
 
         let challenge: Challenge = match challenge_result {
@@ -244,33 +219,34 @@ impl HttpS3Authorization {
             _ => false,
         };
 
-        if challenge_valid && auth_valid {
-            Ok(None)
-        } else {
-            Ok(Some(auth))
-        }
+        Ok((auth, challenge, challenge_valid && auth_valid))
     }
 
-    pub(crate) async fn cleanup(&self, auth: Authorization) -> Result<(), LambdaError> {
-        let (_, token) = get_challenge_token_for_auth(&auth, CHALLENGE_TYPE_HTTP01)?;
-        // Remove the challenge from S3.
+    async fn cleanup(&self, directives: Vec<CleanupDirective>) -> Result<(), LambdaError> {
         let s3_client = S3Client::new(self.region.as_ref().expect("Region not initialized").clone());
-        let s3_key = self.get_s3_key_for_token(&token);
 
-        let do_request = DeleteObjectRequest {
-            bucket: self.bucket.clone(),
-            key: s3_key.clone(),
-            ..Default::default()
-        };
-
-        match s3_client.delete_object(do_request).await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                error!("Failed to delete challenge token from s3://{}/{}: {}", self.bucket, s3_key, e);
-                // This is not fatal, so we don't return an error.
-                Ok(())
+        for directive in directives {
+            match directive {
+                CleanupDirective::DeleteS3Object {
+                    bucket,
+                    key,
+                } => {
+                    let do_request = DeleteObjectRequest {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        ..Default::default()
+                    };
+                    if let Err(e) = s3_client.delete_object(do_request).await {
+                        error!("Failed to delete challenge token from s3://{}/{}: {}", bucket, key, e);
+                    }
+                }
+                _ => {
+                    error!("Unsupported cleanup directive: {:?}", directive);
+                }
             }
         }
+
+        Ok(())
     }
 }
 
@@ -290,15 +266,16 @@ impl HttpS3Authorization {
 ///     }
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct HttpApiGatewayAuthorization {
-    #[serde(rename = "KmsKeyId")]
+    #[serde(rename = "KmsKeyId", default)]
     pub(crate) kms_key_id: Option<String>,
 
-    #[serde(rename = "SsmTier")]
+    #[serde(rename = "SsmTier", default)]
     pub(crate) ssm_tier: Option<String>,
 }
 
-impl HttpApiGatewayAuthorization {
-    pub(crate) async fn setup(&mut self) -> Result<(), LambdaError> {
+#[async_trait]
+impl AuthorizationHandler for HttpApiGatewayAuthorization {
+    async fn setup(&mut self) -> Result<(), LambdaError> {
         match &self.ssm_tier {
             None => (),
             Some(value) => match value.as_ref() {
@@ -310,7 +287,10 @@ impl HttpApiGatewayAuthorization {
         Ok(())
     }
 
-    pub(crate) async fn auth(&self, auth: Authorization) -> Result<Option<Authorization>, LambdaError> {
+    async fn auth(
+        &self,
+        auth: Authorization,
+    ) -> Result<(Authorization, Challenge, Vec<CleanupDirective>), LambdaError> {
         debug!("Handling authorization: {:?}", auth);
         let domain_name: &str = &auth.identifier.value;
         let (challenge, token) = get_challenge_token_for_auth(&auth, CHALLENGE_TYPE_HTTP01)?;
@@ -366,13 +346,19 @@ impl HttpApiGatewayAuthorization {
             }
         };
 
-        self.check(auth).await
+        let cleanup = vec![CleanupDirective::DeleteSSMParameter {
+            parameter_name,
+        }];
+
+        Ok((auth, challenge, cleanup))
     }
 
-    pub(crate) async fn check(&self, auth: Authorization) -> Result<Option<Authorization>, LambdaError> {
+    async fn check(
+        &self,
+        auth: Authorization,
+        challenge: Challenge,
+    ) -> Result<(Authorization, Challenge, bool), LambdaError> {
         let domain_name: String = auth.identifier.value.clone();
-        let (challenge, _token) = get_challenge_token_for_auth(&auth, CHALLENGE_TYPE_HTTP01)?;
-
         let (challenge_result, auth_result) = tokio::join!(challenge.poll(), auth.poll(),);
 
         let challenge: Challenge = match challenge_result {
@@ -409,65 +395,32 @@ impl HttpApiGatewayAuthorization {
             _ => false,
         };
 
-        if challenge_valid && auth_valid {
-            Ok(None)
-        } else {
-            Ok(Some(auth))
-        }
+        Ok((auth, challenge, challenge_valid && auth_valid))
     }
 
-    pub(crate) async fn cleanup(&self, auth: Authorization) -> Result<(), LambdaError> {
-        let (_, token) = get_challenge_token_for_auth(&auth, CHALLENGE_TYPE_HTTP01)?;
-        // Remove the challenge from SSM.
+    async fn cleanup(&self, directives: Vec<CleanupDirective>) -> Result<(), LambdaError> {
         let ssm_client = SsmClient::new(Region::default());
-        let parameter_name = get_ssm_parameter_for_token(&token);
+        for directive in directives {
+            match directive {
+                CleanupDirective::DeleteSSMParameter {
+                    parameter_name,
+                } => {
+                    let dpr = DeleteParameterRequest {
+                        name: parameter_name.clone(),
+                        ..Default::default()
+                    };
 
-        let dpr = DeleteParameterRequest {
-            name: parameter_name.clone(),
-            ..Default::default()
-        };
+                    if let Err(e) = ssm_client.delete_parameter(dpr).await {
+                        error!("Failed to delete key authorization from SSM parameter {}: {}", parameter_name, e);
+                    }
+                }
 
-        info!("Removing key authorization from SSM parameter {}", parameter_name);
-        match ssm_client.delete_parameter(dpr).await {
-            Ok(_) => {
-                info!("Removed authorization from SSM parameter {}", parameter_name);
-                Ok(())
-            }
-            Err(e) => {
-                error!(
-                    "Failed to delete key authorization from SSM parameter {}: {}",
-                    parameter_name, e
-                );
-                Err(Box::new(e))
+                _ => error!("Unsupported cleanup directive: {:?}", directive),
             }
         }
+
+        Ok(())
     }
-}
-
-fn get_challenge_token_for_auth(
-    auth: &Authorization,
-    challenge_type: &str,
-) -> Result<(Challenge, String), LambdaError> {
-    let domain_name: &str = &auth.identifier.value;
-
-    // Look for the http-01 challenge.
-    let challenge = match auth.get_challenge(challenge_type) {
-        Some(c) => c,
-        None => {
-            error!("No {} challenge found for {}", challenge_type, domain_name);
-            return Err(CertificateRequestError::challenge_not_available(challenge_type, domain_name));
-        }
-    };
-
-    let token = match &challenge.token {
-        Some(t) => t.clone(),
-        None => {
-            error!("No {} token found for {}", challenge_type, domain_name);
-            return Err(CertificateRequestError::token_not_available(challenge_type, domain_name));
-        }
-    };
-
-    Ok((challenge, token))
 }
 
 fn get_ssm_parameter_for_token(token: &str) -> String {

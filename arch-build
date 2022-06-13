@@ -1,0 +1,24 @@
+#!/bin/bash -ex
+if [[ $# -ne 1 ]]; then
+    echo "Usage: build-arch <aarch64|x86_64>" 1>&2;
+    exit 1;
+fi
+
+TARGET_ARCH="$1"
+
+case "$TARGET_ARCH" in
+    aarch64 ) DOCKER_PLATFORM="linux/arm64";;
+    x86_64 ) DOCKER_PLATFORM="linux/amd64";;
+    * ) echo "Unknown target architecture $TARGET_ARCH" 1>&2; exit 1;;
+esac;
+
+LOCAL_BUILD=0
+if [[ "$(uname -s)" = "Linux" && "$(uname -m)" = "$TARGET_ARCH" ]]; then
+    rm -f target/release/bootstrap
+    cargo build --release
+    ln target/release/letsencrypt-certs-aws target/release/bootstrap
+    zip -9 --junk-paths letsencrypt-certs-aws-$TARGET_ARCH.zip target/release/bootstrap
+else
+    docker buildx build --builder multiplatform --platform linux/$PLATFORM -f linux-build.dockerfile --tag letsencrypt-certs-aws:$TARGET_ARCH --load .
+    docker run --rm --mount type=bind,source=$PWD,destination=/export letsencrypt-certs-aws:$TARGET_ARCH cp /letsencrypt-certs-aws-$TARGET_ARCH.zip /export/
+fi;

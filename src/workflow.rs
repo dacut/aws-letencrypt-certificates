@@ -1,21 +1,27 @@
-use std::{str::from_utf8, sync::Arc};
-use crate::{
-    auth::CertificateAuthorization,
-    errors::CertificateRequestError,
-    events::{CertificateResponse, CertificateResponseStatus, Response, ValidationState},
-    storage::{CertificateStorage, CertificateStorageResult},
-    utils::{CertificateComponents, ssm_acme_parameter_path},
+use {
+    crate::{
+        auth::{AuthorizationHandler, CertificateAuthorization},
+        errors::CertificateRequestError,
+        events::{CertificateResponse, CertificateResponseStatus, Response},
+        storage::{CertificateStorage, CertificateStorageResult},
+        utils::{ssm_acme_parameter_path, CertificateComponents},
+    },
+    acme2::{Account, AccountBuilder, Authorization, Csr, Directory, DirectoryBuilder, Order, OrderBuilder, OrderStatus},
+    futures::stream::{FuturesOrdered, StreamExt},
+    lamedh_runtime::{self, Error as LambdaError},
+    log::{debug, error, info},
+    openssl::{
+        pkey::{PKey, Private},
+        rsa::Rsa,
+    },
+    rusoto_core::{Region, RusotoError},
+    rusoto_ssm::{GetParameterError, GetParameterRequest, PutParameterRequest, Ssm, SsmClient},
+    std::{str::from_utf8, sync::Arc, time::Duration},
+    tokio::time::sleep,
 };
-use acme2::{Account, AccountBuilder, Csr, DirectoryBuilder, Directory, Order, OrderBuilder, OrderStatus};
-use futures::stream::{FuturesOrdered, StreamExt};
-use lamedh_runtime::{self, Error as LambdaError};
-use log::{debug, error, info};
-use openssl::{
-    pkey::{PKey, Private},
-    rsa::Rsa,
-};
-use rusoto_core::{Region, RusotoError};
-use rusoto_ssm::{GetParameterError, GetParameterRequest, PutParameterRequest, Ssm, SsmClient};
+
+const CHECK_WAIT_DURATION: Duration = Duration::from_secs(5);
+const MAX_ORDER_RETRIES: usize = 36; // 36 * 5 = 180 seconds
 
 pub(crate) struct ValidatedCertificateRequest {
     /// The URL for the ACME server, e.g. `"https://acme-staging-v02.api.letsencrypt.org/directory"`
@@ -24,20 +30,11 @@ pub(crate) struct ValidatedCertificateRequest {
     pub(crate) contacts: Vec<String>,
     pub(crate) auth: CertificateAuthorization,
     pub(crate) storage: Vec<CertificateStorage>,
-    pub(crate) state: Option<ValidationState>,
     pub(crate) dir_host: String,
 }
 
 impl ValidatedCertificateRequest {
-    pub(crate) async fn run_workflow(&self) -> Result<Response, LambdaError> {
-        if self.state.is_none() {
-            self.handle_initial_request().await
-        } else {
-            self.handle_pending_validation_request().await
-        }
-    }
-
-    async fn handle_initial_request(&self) -> Result<Response, LambdaError> {
+    pub(crate) async fn run_workflow(&mut self) -> Result<Response, LambdaError> {
         let mut db = DirectoryBuilder::new(self.directory.clone());
         let dir: Arc<Directory> = db.build().await?;
 
@@ -46,6 +43,9 @@ impl ValidatedCertificateRequest {
         account_builder.terms_of_service_agreed(true);
 
         self.set_private_key(&mut account_builder).await?;
+
+        info!("Setting up authorization handler");
+        self.auth.setup().await?;
 
         info!("Creating/finding existing account from directory {}", self.directory);
         let account: Arc<Account> = account_builder.build().await?;
@@ -69,73 +69,88 @@ impl ValidatedCertificateRequest {
         let mut auth_futures = FuturesOrdered::new();
         for auth in authorizations {
             // Perform each authorization asynchronously.
-            auth_futures.push(self.auth.auth(auth));
+            auth_futures.push(self.handle_authorization(auth));
         }
 
-        let mut incomplete_auths = false;
+        let mut errors = Vec::new();
         while let Some(result) = auth_futures.next().await {
             match result {
-                Ok(maybe_auth) => {
-                    if let Some(_) = maybe_auth {
-                        incomplete_auths = true;
-                    }
-                },
+                Ok(()) => (),
                 Err(e) => {
                     error!("Authorization failed: {}", e);
-                    return Err(e)
+                    errors.push(e);
                 }
             }
         }
 
-        if incomplete_auths {
-            return Ok(Response::Certificate(CertificateResponse {
-                finished: false,
-                status: CertificateResponseStatus::PendingValidation,
-                storage: vec![],
-                state: Some(ValidationState {
-                    order: order,
-                    private_key: None,
-                    n_tries: 1,
-                })
-            }))
+        if !errors.is_empty() {
+            return Err(errors.into_iter().next().unwrap());
         }
-        
-        // Update the order status.
-        let order = match order.poll().await {
-            Ok(order) => order,
-            Err(e) => {
-                error!("Failed to update order status: {}", e);
-                return Err(Box::new(e));
-            }
-        };
 
+        // Wait until the order is ready to be finalized.
+        let order = order.wait_ready(CHECK_WAIT_DURATION, MAX_ORDER_RETRIES).await?;
+        
         match &order.status {
-            OrderStatus::Pending => {
-                info!("Order is still pending");
-                Ok(Response::Certificate(CertificateResponse {
-                    finished: false,
-                    status: CertificateResponseStatus::PendingValidation,
-                    storage: vec![],
-                    state: Some(ValidationState {
-                        order: order,
-                        private_key: None,
-                        n_tries: 1,
-                    })
-                }))
-            }
-            OrderStatus::Ready => self.finalize_order(order, 0).await,
             OrderStatus::Invalid => {
                 error!("Order has become invalid");
-                Err(CertificateRequestError::order_failed())
+                return Err(CertificateRequestError::order_failed());
             }
-            OrderStatus::Processing | OrderStatus::Valid => {
-                error!("Order is processing or valid, but we have not finalized it yet! status = {:?}", order.status);
-                Err(CertificateRequestError::order_failed())
+            OrderStatus::Ready => info!("Order is ready to be finalized"),
+            _ => {
+                error!("Unexpected order status: {:?}", order.status);
+                return Err(CertificateRequestError::order_failed());
             }
         }
+
+        info!("Finalizing order");
+        let (order, pkey_pem) = self.finalize_order(order).await?;
+
+        info!("Retrieving certificates");
+        let components = self.retrieve_order(order, pkey_pem).await?;
+
+        self.save_certificates(components).await
     }
 
-    async fn finalize_order(&self, order: Order, n_tries: u32) -> Result<Response, LambdaError> {
+    async fn handle_authorization(&self, auth: Authorization) -> Result<(), LambdaError> {
+        let domain_name = auth.identifier.value.to_string();
+        info!("Requesting authorization for domain {}", domain_name);
+        let (mut auth, mut challenge, cleanup_directives) = self.auth.auth(auth).await?;
+
+        info!("Authorization request for {} complete; waiting for validation", domain_name);
+
+        loop {
+            sleep(CHECK_WAIT_DURATION).await;
+
+            match self.auth.check(auth, challenge).await {
+                Err(e) => {
+                    error!("Authorization validation for {} failed: {}", domain_name, e);
+
+                    if let Err(e2) = self.auth.cleanup(cleanup_directives).await {
+                        error!("Authorization cleanup for {} failed: {}", domain_name, e2);
+                    }
+
+                    return Err(e);
+                }
+
+                Ok((a, e, done)) => {
+                    (auth, challenge) = (a, e);
+                    if done {
+                        break;
+                    }
+                }
+            }
+        }
+
+        info!("Cleaning up authorization for domain {}", domain_name);
+        if let Err(e) = self.auth.cleanup(cleanup_directives).await {
+            error!("Authorization cleanup for {} failed: {}", domain_name, e);
+            info!("Ignoring error and continuing");
+        }
+
+        Ok(())
+    }
+
+    async fn finalize_order(&self, order: Order) -> Result<(Order, String), LambdaError> {
         info!("Finalizing order");
 
         // All authorizations passed successfully. Finalize the order.
@@ -169,11 +184,15 @@ impl ValidatedCertificateRequest {
             }
         };
 
-        let order = match order.poll().await {
-            Ok(order) => order,
+        // Wait for the order to be ready.
+        let order = match order.wait_done(CHECK_WAIT_DURATION, MAX_ORDER_RETRIES).await {
+            Ok(order) => {
+                info!("Order finalization complete.");
+                order
+            }
             Err(e) => {
-                error!("Failed to get current status of order: {}", e);
-                return Err(Box::new(e))
+                error!("Order finalization failed: {:#}", e);
+                return Err(Box::new(e));
             }
         };
 
@@ -182,24 +201,15 @@ impl ValidatedCertificateRequest {
                 error!("Error has become invalid");
                 Err(CertificateRequestError::order_failed())
             }
-            OrderStatus::Valid => self.retrieve_order(order, pkey_pem).await,
+            OrderStatus::Valid => Ok((order, pkey_pem)),
             _ => {
-                info!("Order not ready yet; status is {:?}", order.status);
-                Ok(Response::Certificate(CertificateResponse {
-                    finished: false,
-                    status: CertificateResponseStatus::PendingOrderFulfillment,
-                    storage: vec![],
-                    state: Some(ValidationState {
-                        order: order,
-                        private_key: Some(pkey_pem),
-                        n_tries: 1 + n_tries,
-                    })
-                }))
+                error!("Unexpected order status: {:?}", order.status);
+                Err(CertificateRequestError::order_failed())
             }
         }
     }
 
-    async fn retrieve_order(&self, order: Order, pkey_pem: String) -> Result<Response, LambdaError> {
+    async fn retrieve_order(&self, order: Order, pkey_pem: String) -> Result<CertificateComponents, LambdaError> {
         // Ready -- download the certificates. We expect at least 2 -- our certificate and the
         // intermediate that signed it.
         info!("Downloading certificates");
@@ -240,20 +250,13 @@ impl ValidatedCertificateRequest {
         let chain_pem = certs_pem[1..].join("\n");
         let cert_pem = certs_pem[0].clone();
         let fullchain_pem = format!("{}\n{}", cert_pem, chain_pem);
-        let domain_names = order.identifiers.iter().map(|i| i.value.clone()).collect::<Vec<String>>();
 
-        let components = CertificateComponents {
+        Ok(CertificateComponents {
             cert_pem,
             chain_pem,
             fullchain_pem,
             pkey_pem,
-        };
-
-        save_certificates(self.storage.clone(), domain_names, components).await
-    }
-
-    async fn handle_pending_validation_request(&self) -> Result<Response, LambdaError> {
-        unimplemented!()
+        })
     }
 
     async fn set_private_key(&self, account_builder: &mut AccountBuilder) -> Result<(), LambdaError> {
@@ -284,16 +287,20 @@ impl ValidatedCertificateRequest {
                         Some(s) => s,
                         None => {
                             error!("No value returned by SSM for {}", pk_param);
-                            return Err(CertificateRequestError::unexpected_aws_response(format!("No value returned for SSM parameter {}", pk_param)))
+                            return Err(CertificateRequestError::unexpected_aws_response(format!(
+                                "No value returned for SSM parameter {}",
+                                pk_param
+                            )));
                         }
                     };
 
                     match PKey::private_key_from_pem(&pkey_str.as_bytes()) {
                         Ok(pkey) => {
                             // Parsed ok -- set it and return.
+                            info!("Using existing private key from SSM parameter {}", pk_param);
                             account_builder.private_key(pkey);
                             account_builder.only_return_existing(true);
-                            return Ok(())
+                            return Ok(());
                         }
                         Err(e) => {
                             error!("Failed to parse private key from SSM: {:#}", e);
@@ -314,12 +321,14 @@ impl ValidatedCertificateRequest {
             }
         };
 
+        info!("Generating new private key");
+
         // No private key exists. Generate one.
         let rsa = match Rsa::generate(2048) {
             Ok(rsa) => rsa,
             Err(e) => {
                 error!("Failed to generate 2048-bit RSA key: {}", e);
-                return Err(Box::new(e))
+                return Err(Box::new(e));
             }
         };
 
@@ -327,7 +336,7 @@ impl ValidatedCertificateRequest {
             Ok(pkey) => pkey,
             Err(e) => {
                 error!("Failed to convert RSA private key to PKey<Private>: {}", e);
-                return Err(Box::new(e))
+                return Err(Box::new(e));
             }
         };
 
@@ -336,7 +345,7 @@ impl ValidatedCertificateRequest {
             Ok(pem) => pem,
             Err(e) => {
                 error!("Failed to convert RSA private key to PEM: {}", e);
-                return Err(Box::new(e))
+                return Err(Box::new(e));
             }
         };
 
@@ -344,7 +353,7 @@ impl ValidatedCertificateRequest {
             Ok(pem_str) => pem_str.to_string(),
             Err(e) => {
                 error!("Generated RSA private key contains non-UTF8 characters: {}", e);
-                return Err(Box::new(e))
+                return Err(Box::new(e));
             }
         };
 
@@ -365,58 +374,58 @@ impl ValidatedCertificateRequest {
                 return Err(Box::new(e));
             }
         }
-        
+
         // And now set this for the account builder.
         account_builder.private_key(pkey);
         Ok(())
     }
-}
 
-async fn save_certificates(storage: Vec<CertificateStorage>, domain_names: Vec<String>, components: CertificateComponents) -> Result<Response, LambdaError> {
-    let mut n_successes = 0u32;
-    let mut n_failures = 0u32;
-
-    let mut futures = FuturesOrdered::new();
-    for storage_provider in &storage {
-        futures.push(storage_provider.save_certificate(
-            domain_names.clone(), components.clone()
-        ));
-    }
-
-    let mut results = Vec::new();
-
-    while let Some(result) = futures.next().await {
-        match result {
-            Ok(result_set) => {
-                for result in result_set {
-                    match &result {
-                        CertificateStorageResult::Error(_) => n_failures += 1,
-                        _ => n_successes += 1,
+    async fn save_certificates(&self, components: CertificateComponents) -> Result<Response, LambdaError> {
+        let mut n_successes = 0u32;
+        let mut n_failures = 0u32;
+    
+        let mut futures = FuturesOrdered::new();
+        for storage_provider in &self.storage {
+            futures.push(storage_provider.save_certificate(self.domain_names.clone(), components.clone()));
+        }
+    
+        let mut results = Vec::new();
+    
+        while let Some(result) = futures.next().await {
+            match result {
+                Ok(result_set) => {
+                    for result in result_set {
+                        match &result {
+                            CertificateStorageResult::Error(_) => n_failures += 1,
+                            _ => n_successes += 1,
+                        }
+    
+                        results.push(result);
                     }
-
-                    results.push(result);
+                }
+                Err(e) => {
+                    error!("Failed to save certificate: {:#}", e);
+                    n_failures += 1;
+                    results.push(CertificateStorageResult::Error(format!("Failed to save certificate: {:#}", e)));
                 }
             }
-            Err(e) => {
-                error!("Failed to save certificate: {:#}", e);
-                n_failures += 1;
-                results.push(CertificateStorageResult::Error(format!("Failed to save certificate: {:#}", e)));
-            }
         }
+    
+        let status = if n_failures > 0 {
+            if n_successes > 0 {
+                CertificateResponseStatus::PartialSuccess
+            } else {
+                CertificateResponseStatus::Failed
+            }
+        } else {
+            CertificateResponseStatus::Success
+        };
+    
+        let cr = CertificateResponse {
+            finished: true,
+            status,
+            storage: results,
+        };
+        Ok(Response::Certificate(cr))
     }
-
-    let status = if n_failures > 0 {
-        if n_successes > 0 { CertificateResponseStatus::PartialSuccess }
-        else { CertificateResponseStatus::Failed } 
-    } else {
-        CertificateResponseStatus::Success
-    };
-
-    let cr = CertificateResponse {
-        finished: true,
-        status,
-        storage: results,
-        state: None,
-    };
-    Ok(Response::Certificate(cr))
 }

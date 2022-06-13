@@ -6,3 +6,5 @@
 
 # Visual Studio Code
 .vscode
+letsencrypt-certs-aws
+*.zip

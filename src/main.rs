@@ -1,22 +1,6 @@
 #![warn(clippy::all)]
 #![allow(clippy::redundant_field_names)]
 
-use aws_lambda_events::{
-    encodings::Body,
-    event::{
-        alb::{AlbTargetGroupRequest, AlbTargetGroupResponse},
-        apigw::{ApiGatewayProxyRequest, ApiGatewayProxyResponse, ApiGatewayV2httpRequest, ApiGatewayV2httpResponse},
-    },
-};
-use http::{HeaderMap, HeaderValue};
-use lamedh_runtime::{self, Context, Error as LambdaError};
-use log::{error, info};
-use rusoto_core::Region;
-use rusoto_ssm::{GetParameterRequest, Ssm, SsmClient};
-use serde::{self, Deserialize, Serialize};
-use serde_json::{Deserializer as JsonDeserializer, Serializer as JsonSerializer, Value};
-use url::Url;
-
 mod auth;
 mod constants;
 mod errors;
@@ -24,10 +8,33 @@ mod events;
 mod storage;
 mod utils;
 mod workflow;
-use errors::InvalidCertificateRequest;
-use events::{CertificateRequest, Request, Response};
-use utils::ssm_acme_parameter_path;
-use workflow::ValidatedCertificateRequest;
+
+use {
+    crate::{
+        auth::AuthorizationHandler,
+        errors::InvalidCertificateRequest,
+        events::{CertificateRequest, Request, Response},
+        utils::ssm_acme_parameter_path,
+        workflow::ValidatedCertificateRequest,
+    },
+    aws_lambda_events::{
+        encodings::Body,
+        event::{
+            alb::{AlbTargetGroupRequest, AlbTargetGroupResponse},
+            apigw::{
+                ApiGatewayProxyRequest, ApiGatewayProxyResponse, ApiGatewayV2httpRequest, ApiGatewayV2httpResponse,
+            },
+        },
+    },
+    http::{HeaderMap, HeaderValue},
+    lamedh_runtime::{self, Context, Error as LambdaError},
+    log::{error, info},
+    rusoto_core::Region,
+    rusoto_ssm::{GetParameterRequest, Ssm, SsmClient},
+    serde::{self, Deserialize, Serialize},
+    serde_json::{Deserializer as JsonDeserializer, Serializer as JsonSerializer, Value},
+    url::Url,
+};
 
 /// Main entrypoint for the runtime. This just dispatches to the Lambda handler.
 #[tokio::main]
@@ -132,13 +139,12 @@ async fn handle_certificate_request(mut req: CertificateRequest) -> Result<Respo
         }
     }
 
-    let req = ValidatedCertificateRequest {
+    let mut req = ValidatedCertificateRequest {
         directory: req.directory,
         domain_names: req.domain_names,
         contacts: req.contacts,
         auth: req.auth,
         storage: req.storage,
-        state: req.state,
         dir_host: dir_host.to_string(),
     };
 

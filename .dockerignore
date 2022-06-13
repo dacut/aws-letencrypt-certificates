@@ -1,5 +1,5 @@
 target/
 .git
-lambda*.zip
+*.zip
 runtime-emulator/
 export/

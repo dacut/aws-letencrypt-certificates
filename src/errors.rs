@@ -94,6 +94,10 @@ pub(crate) enum InvalidCertificateRequest {
     InvalidAcmConfiguration(String),
     InvalidContact(String),
     InvalidDirectoryUrl(String),
+
+    /// The Route 53 hosted zone does not match the domain name.
+    InvalidRoute53HostedZone(String),
+
     InvalidS3EncryptionAlgorithm(String),
 
     /// The location of the S3 bucket could not be determined.
@@ -104,6 +108,9 @@ pub(crate) enum InvalidCertificateRequest {
 
     /// The SSM tier specified was invalid.
     InvalidSsmTier(String),
+
+    /// No Route 53 hosted zones were found that match the domain name.
+    NoMatchingRoute53Zones(String),
 }
 
 impl InvalidCertificateRequest {
@@ -135,6 +142,10 @@ impl InvalidCertificateRequest {
         Box::new(Self::InvalidDirectoryUrl(msg.into()))
     }
 
+    pub(crate) fn invalid_route53_hosted_zone<S: Into<String>>(msg: S) -> Box<Self> {
+        Box::new(Self::InvalidRoute53HostedZone(msg.into()))
+    }
+
     pub(crate) fn invalid_s3_bucket<S: Into<String>>(bucket: S) -> Box<Self> {
         Box::new(Self::InvalidS3Bucket(bucket.into()))
     }
@@ -150,6 +161,10 @@ impl InvalidCertificateRequest {
     pub(crate) fn invalid_ssm_tier<S: Into<String>>(tier: S) -> Box<Self> {
         Box::new(Self::InvalidSsmTier(tier.into()))
     }
+
+    pub(crate) fn no_matching_route53_zones<S: Into<String>>(msg: S) -> Box<Self> {
+        Box::new(Self::NoMatchingRoute53Zones(msg.into()))
+    }
 }
 
 impl Display for InvalidCertificateRequest {
@@ -162,10 +177,12 @@ impl Display for InvalidCertificateRequest {
             Self::InvalidAcmConfiguration(msg) => write!(f, "Invalid ACM configuration: {}", msg),
             Self::InvalidContact(msg) => write!(f, "Invalid contact: {}", msg),
             Self::InvalidDirectoryUrl(msg) => write!(f, "Invalid directory URL: {}", msg),
+            Self::InvalidRoute53HostedZone(msg) => write!(f, "Invalid Route 53 hosted zone: {}", msg),
             Self::InvalidS3EncryptionAlgorithm(alg) => write!(f, "Invalid S3EncryptionAlgorithm: {}", alg),
             Self::InvalidS3Bucket(bucket) => write!(f, "Invalid S3 bucket: {}", bucket),
             Self::InvalidSsmParameterPath(path) => write!(f, "Invalid SSM parameter path: {}", path),
             Self::InvalidSsmTier(tier) => write!(f, "Invalid SSM tier: {}", tier),
+            Self::NoMatchingRoute53Zones(domain) => write!(f, "No matching Route 53 zones for domain: {}", domain),
         }
     }
 }

@@ -1,17 +1,16 @@
-ARG SOURCE
-FROM $SOURCE
-RUN yum update -y \
-    && amazon-linux-extras install -y rust1 \
-    && yum install -y bzip2 openssl-devel tar zip \
-    && mkdir /letsencrypt-certs-aws
-COPY Cargo.lock Cargo.toml /letsencrypt-certs-aws/
-COPY src /letsencrypt-certs-aws/src/
+FROM amazonlinux:2
+RUN yum update -y && yum groupinstall -y 'Development Tools' && yum install -y bzip2 openssl-devel tar zip
+COPY ["rustup-init", "/tmp/"]
+RUN /tmp/rustup-init -y --default-toolchain nightly --profile minimal
+ENV PATH=/root/.cargo/bin:$PATH
+RUN mkdir /letsencrypt-certs-aws
+COPY ["Cargo.lock", "Cargo.toml", "/letsencrypt-certs-aws/"]
+COPY ["src", "/letsencrypt-certs-aws/src/"]
 WORKDIR /letsencrypt-certs-aws
-RUN ls -laR
-RUN cargo build
-WORKDIR /letsencrypt-certs-aws/target/debug
 RUN pwd
-ARG ARCH
+RUN ls -laR
+RUN cargo build --release
+WORKDIR /letsencrypt-certs-aws/target/release
 RUN ln letsencrypt-certs-aws bootstrap \
-    && zip -9 /lambda-$ARCH.zip bootstrap
+    && zip -9 /letsencrypt-certs-aws-$(uname -m | sed -e 's/aarch64/arm64/').zip bootstrap
 VOLUME /export
